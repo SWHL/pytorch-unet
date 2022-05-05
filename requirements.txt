@@ -1,0 +1,8 @@
+torchvision==0.8.2+cu101
+torch==1.7.1+cu101
+numpy==1.20.3
+matplotlib==3.2.2
+torchsummary==1.5.1
+onnx==1.10.1
+opencv_python==4.5.3.56
+onnxruntime==1.11.0

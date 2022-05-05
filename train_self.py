@@ -1,8 +1,11 @@
 # !/usr/bin/env python
 # -*- encoding: utf-8 -*-
+import cv2
+import time
 import copy
 import time
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -10,13 +13,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, Dataset
-from torchsummary import summary
 from torchvision import transforms
 
-import helper
 import pytorch_unet
-import simulation
 from loss import dice_loss
+
+import os
+gpu_id = ['0', '1']
+os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(gpu_id)
 
 
 def reverse_transform(inp):
@@ -51,6 +55,9 @@ def print_metrics(metrics, epoch_samples, phase):
 
 
 def train_model(model, optimizer, scheduler, num_epochs=25):
+    time_stamp = time.strftime('%Y-%m-%d-%H-%M-%S',
+                               time.localtime(time.time()))
+
     best_model_wts = copy.deepcopy(model.state_dict())
     best_loss = 1e-10
 
@@ -97,18 +104,21 @@ def train_model(model, optimizer, scheduler, num_epochs=25):
             print_metrics(metrics, epoch_samples, phase)
             epoch_loss = metrics['loss'] / epoch_samples
 
+            save_dir = Path(f'exp/{time_stamp}')
+            save_dir.mkdir(parents=True, exist_ok=True)
+
             # deep copy the model
-            if phase == 'val' and epoch_loss < best_loss:
+            if phase == 'val':
                 print("saving best model")
                 best_loss = epoch_loss
                 best_model_wts = copy.deepcopy(model.state_dict())
 
-                torch.save(model.state_dict(), 'exp/best.pth')
+                torch.save(model.state_dict(), f'{save_dir}/best.pth')
             else:
-                torch.save(model.state_dict(), 'exp/latest.pth')
+                torch.save(model.state_dict(), f'{save_dir}/latest.pth')
 
         time_elapsed = time.time() - since
-        print('{:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+        print('cost: {:.0f} m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
 
     print('Best val loss: {:4f}'.format(best_loss))
 
@@ -117,15 +127,25 @@ def train_model(model, optimizer, scheduler, num_epochs=25):
     return model
 
 
-class SimDataset(Dataset):
-    def __init__(self, count, transform=None):
-        self.input_images, self.target_masks = simulation.generate_random_data(
-            192, 192, count=count)
+class SubtitleDataset(Dataset):
+    def __init__(self, data_dir, transform=None):
+        self.img_list = list((Path(data_dir) / 'images').iterdir())
+        self.gt_dir = Path(data_dir) / 'masks'
+
         self.transform = transform
 
     def __getitem__(self, idx):
-        image = self.input_images[idx]
-        mask = self.target_masks[idx]
+        img_path = self.img_list[idx]
+        image = cv2.imread(str(img_path))
+        image = self.scale_resize(image).astype(np.float32)
+        image /= 255.0
+
+        mask_path = self.gt_dir / Path(img_path).name
+        mask = cv2.imread(str(mask_path))
+        mask = self.scale_resize(mask)
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+        mask = mask[np.newaxis, ...].astype(np.float32)
+        mask /= 255
 
         if self.transform:
             image = self.transform(image)
@@ -133,30 +153,51 @@ class SimDataset(Dataset):
         return [image, mask]
 
     def __len__(self):
-        return len(self.input_images)
+        return len(self.img_list)
+
+    @staticmethod
+    def scale_resize(img, resize_value=(480, 480)):
+        '''
+        @params:
+        img: ndarray
+        resize_value: (width, height)
+        '''
+        # padding
+        ratio = resize_value[0] / resize_value[1]  # w / h
+        h, w = img.shape[:2]
+        if w / h < ratio:
+            # 补宽
+            t = int(h * ratio)
+            w_padding = (t - w) // 2
+            img = cv2.copyMakeBorder(img, 0, 0, w_padding, w_padding,
+                                        cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        else:
+            # 补高  (left, upper, right, lower)
+            t = int(w / ratio)
+            h_padding = (t - h) // 2
+            color = tuple([int(i) for i in img[0, 0, :]])
+            img = cv2.copyMakeBorder(img, h_padding, h_padding, 0, 0,
+                                        cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        img = cv2.resize(img, resize_value,
+                            interpolation=cv2.INTER_LANCZOS4)
+        return img
 
 
 if __name__ == '__main__':
-    # Generate some random images
-    input_images, target_masks = simulation.generate_random_data(192, 192, count=3)
-
-    # Change channel-order and make 3 channels for matplot
-    input_images_rgb = [x.astype(np.uint8) for x in input_images]
-
-    # Map each channel (i.e. class) to each color
-    target_masks_rgb = [helper.masks_to_colorimg(x) for x in target_masks]
 
     # use same transform for train/val for this example
     trans = transforms.Compose([
         transforms.ToTensor(),
     ])
 
-    train_set = SimDataset(2000, transform=trans)
-    val_set = SimDataset(200, transform=trans)
+    train_set = SubtitleDataset(data_dir='datasets/gen_datasets/train',
+                                transform=trans)
+    val_set = SubtitleDataset(data_dir='datasets/gen_datasets/val',
+                              transform=trans)
 
     image_datasets = {'train': train_set, 'val': val_set}
 
-    batch_size = 48
+    batch_size = 16
 
     dataloaders = {
         'train': DataLoader(train_set, batch_size=batch_size,
@@ -172,10 +213,11 @@ if __name__ == '__main__':
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    num_class = 6
+    num_class = 1
 
-    model = pytorch_unet.ResNetUNet(num_class).to(device)
-    summary(model, input_size=(3, 224, 224))
+    model = pytorch_unet.ResNetUNet(num_class)
+    model = torch.nn.DataParallel(model, device_ids=list(range(len(gpu_id))))
+    model.to(device)
 
     optimizer_ft = optim.Adam(model.parameters(), lr=1e-3)
 
